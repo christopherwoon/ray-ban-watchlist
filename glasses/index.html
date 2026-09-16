@@ -332,9 +332,540 @@ body {
     </div>
   </div>
 
-  <script src="../storage.js"></script>
-  <script src="../scoring.js"></script>
-  <script src="../data.js"></script>
-  <script src="app.js"></script>
+
+  <!-- Inlined from ../storage.js, ../scoring.js, ../data.js, and app.js
+       (kept in sync manually) for the same reason the CSS above is inlined:
+       on-device testing showed the glasses WebView intermittently failing to
+       load one of these four separate <script src> requests while
+       index.html itself loaded fine. Because app.js is the last of the four,
+       losing just it (or an earlier file it depends on) left the static HTML
+       shell visible -- header and "+ Add Ticker" button render from markup
+       alone -- with an empty #tickerList (never populated, since renderHome()
+       never ran) and every click a no-op (setupEvents() never ran either).
+       A single inline <script> removes that whole class of failure by
+       collapsing four network requests into the one that already has to
+       succeed for the page to exist at all. -->
+  <script>
+// Shared watchlist storage — backed by /api/watchlist (Vercel + Upstash
+// Redis) so the phone edit page and the glasses app, which run in separate
+// browser contexts, see the same state. There is no window.storage bridge
+// in the real Meta Wearables toolkit (confirmed against the actual SDK) —
+// it uses plain localStorage per-device, which can't sync across surfaces
+// on its own. localStorage here is only a last-resort offline fallback if
+// the network call fails; it is NOT synced across devices in that case.
+
+async function storageGet(key) {
+  try {
+    const res = await fetch('/api/watchlist');
+    if (!res.ok) throw new Error(`watchlist ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return data.watchlist ?? null;
+  } catch (e) {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  }
+}
+
+async function storageSet(key, value) {
+  try {
+    const res = await fetch('/api/watchlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ watchlist: value }),
+    });
+    if (!res.ok) throw new Error(`watchlist ${res.status}`);
+    localStorage.setItem(key, JSON.stringify(value)); // offline fallback cache
+    return true;
+  } catch (e) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) { /* ignore */ }
+    return false;
+  }
+}
+
+// Catalyst scoring — decides which headline to surface per ticker and
+// whether it earns the "CATALYST" tag. Mirrors the conviction-scoring
+// spirit of the swing-trade-architect / daily-catalyst-scanner skills
+// (category weight + recency + real-move confirmation) rather than
+// inventing a separate ranking system.
+
+const CATEGORY_WEIGHT = {
+  earnings: 1.0,
+  guidance: 0.85,
+  'M&A': 0.95,
+  regulatory: 0.75,
+  analyst_action: 0.55,
+  other: 0.25,
+};
+
+const CATALYST_THRESHOLD = 0.5;
+const RECENCY_HALF_LIFE_MIN = 90;
+const REAL_MOVE_PCT = 1.5;
+
+function recencyDecay(minutesAgo, halfLife = RECENCY_HALF_LIFE_MIN) {
+  return Math.pow(0.5, minutesAgo / halfLife);
+}
+
+function scoreArticle(article, priceChangePct) {
+  const catWeight = CATEGORY_WEIGHT[article.category] ?? CATEGORY_WEIGHT.other;
+  const decay = recencyDecay(article.minutesAgo);
+  const isRealMove = Math.abs(priceChangePct) >= REAL_MOVE_PCT;
+  return catWeight * decay * (isRealMove ? 1.25 : 1.0);
+}
+
+// Returns articles sorted best-first, each annotated with `score` and `top`.
+function rankArticles(articles, priceChangePct) {
+  return articles
+    .map((a) => ({ ...a, score: scoreArticle(a, priceChangePct) }))
+    .sort((a, b) => b.score - a.score)
+    .map((a, i) => ({ ...a, top: i === 0 }));
+}
+
+function shouldTagCatalyst(rankedArticles) {
+  return rankedArticles.length > 0 && rankedArticles[0].score >= CATALYST_THRESHOLD;
+}
+
+// Real data comes from /api/quote and /api/news (Yahoo Finance chart data +
+// Google News RSS, both no-API-key — see api/_shared.py). If those calls
+// fail (offline, rate-limited, or running without devserver.py/Vercel),
+// fetchQuote/fetchHeadlines fall back to the mock generators below so the
+// UI never breaks.
+//
+// fetchQuote(ticker)      -> Promise<{ price: number, changePct: number }>
+// fetchHeadlines(ticker)  -> Promise<Array<{ source, minutesAgo, text, category }>>
+
+const DEFAULT_TICKERS = [
+  'ARM', 'AMD', 'INTC', 'AVGO', 'MU', 'CRWD', 'TSM', 'NFLX', 'NVDA', 'PANW',
+  'QCOM', 'AAPL', 'MSFT', 'SNOW', 'PLTR', 'AMZN', 'GOOGL', 'TSLA', 'META',
+];
+
+const BASE_PRICES = {
+  ARM: 162.88, AMD: 171.30, INTC: 31.42, AVGO: 268.11, MU: 142.05,
+  CRWD: 412.60, TSM: 221.67, NFLX: 987.30, NVDA: 187.42, PANW: 198.55,
+  QCOM: 168.20, AAPL: 231.10, MSFT: 468.90, SNOW: 178.40, PLTR: 148.92,
+  AMZN: 228.75, GOOGL: 196.30, TSLA: 342.15, META: 712.80,
+};
+
+// Curated stub headlines for names with a specific mockup catalyst; other
+// tickers draw from the generic pool below.
+const CURATED_HEADLINES = {
+  NVDA: [{ source: 'Reuters', minutesAgo: 14, category: 'guidance', text: 'Blackwell supply tightens into Q3, per component suppliers.' }],
+  MU: [{ source: 'Morgan Stanley', minutesAgo: 22, category: 'analyst_action', text: 'HBM4 demand outlook raised on AI accelerator attach-rate assumptions.' }],
+  AMD: [{ source: "Tom's Hardware", minutesAgo: 36, category: 'other', text: 'Leaked roadmap slide shows MI400 timeline shift, unconfirmed by AMD.' }],
+  ARM: [{ source: 'Bloomberg', minutesAgo: 60, category: 'regulatory', text: 'Court filing update in the ongoing Arm-Qualcomm licensing dispute.' }],
+  PLTR: [{ source: 'Reuters', minutesAgo: 18, category: 'M&A', text: 'New government contract expansion disclosed with an existing agency.' }],
+  TSM: [{ source: 'Reuters', minutesAgo: 48, category: 'regulatory', text: 'Reported changes to Taiwan chip export licensing rules.' }],
+  AVGO: [{ source: "Barron's", minutesAgo: 120, category: 'guidance', text: 'Management reiterates multi-year custom silicon backlog visibility.' }],
+};
+
+const GENERIC_TEMPLATES = [
+  { category: 'analyst_action', text: 'Analyst raises price target on {T} citing margin trends.' },
+  { category: 'analyst_action', text: 'Sell-side note trims {T} rating on valuation concerns.' },
+  { category: 'guidance', text: '{T} reiterates full-year guidance at investor conference.' },
+  { category: 'guidance', text: '{T} management flags supply constraints on latest call.' },
+  { category: 'regulatory', text: 'Regulatory filing flags a disclosure update for {T}.' },
+  { category: 'earnings', text: '{T} beats consensus estimates on top line, mixed on margins.' },
+  { category: 'M&A', text: '{T} explores strategic partnership options per sources.' },
+  { category: 'other', text: '{T} trades in line with the broader sector move today.' },
+];
+
+function seededRandom(seed) {
+  let x = Math.sin(seed) * 10000;
+  return x - Math.floor(x);
+}
+
+function hashString(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function pickGenericTemplates(ticker, count) {
+  const start = hashString(ticker) % GENERIC_TEMPLATES.length;
+  const picked = [];
+  for (let i = 0; i < count; i++) {
+    picked.push(GENERIC_TEMPLATES[(start + i) % GENERIC_TEMPLATES.length]);
+  }
+  return picked;
+}
+
+function mockQuote(ticker, tick = 0) {
+  const base = BASE_PRICES[ticker] ?? 100;
+  const seed = hashString(ticker) + tick * 97;
+  const wobble = (seededRandom(seed) - 0.5) * 0.06; // +/-3%
+  const price = base * (1 + wobble);
+  const changePct = wobble * 100;
+  return { price: Number(price.toFixed(2)), changePct: Number(changePct.toFixed(2)) };
+}
+
+function mockHeadlines(ticker, tick = 0) {
+  const curated = (CURATED_HEADLINES[ticker] ?? []).map((h) => ({ ...h, minutesAgo: h.minutesAgo + tick }));
+  const genericCount = 3 - curated.length;
+  const generic = pickGenericTemplates(ticker, Math.max(genericCount, 1)).map((tpl, i) => ({
+    source: ['Bloomberg', 'CNBC', 'Reuters'][i % 3],
+    minutesAgo: 30 + i * 45 + tick,
+    category: tpl.category,
+    text: tpl.text.replace('{T}', ticker),
+  }));
+  return [...curated, ...generic].slice(0, 3);
+}
+
+async function fetchQuote(ticker, tick = 0) {
+  try {
+    const res = await fetch(`/api/quote?symbol=${encodeURIComponent(ticker)}`);
+    if (!res.ok) throw new Error(`quote ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return data;
+  } catch (e) {
+    return mockQuote(ticker, tick);
+  }
+}
+
+async function fetchHeadlines(ticker, tick = 0) {
+  try {
+    const res = await fetch(`/api/news?symbol=${encodeURIComponent(ticker)}`);
+    if (!res.ok) throw new Error(`news ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return data.length ? data : mockHeadlines(ticker, tick);
+  } catch (e) {
+    return mockHeadlines(ticker, tick);
+  }
+}
+
+// D-pad navigable glasses app — screen/focus architecture copied from the
+// real toolkit's create-webapp template (arrow keys move focus with
+// wrap-around, Enter activates, Escape goes back). Data comes from the
+// existing ../data.js, ../scoring.js, ../storage.js — this file only owns
+// screens/rendering/focus, matching the real hardware's D-pad-only input
+// model (no touch/mouse — confirmed against display-guidelines.md in the
+// cloned toolkit repo).
+//
+// The Add Ticker screen uses a plain <input> (see vanilla-patterns.md's
+// "Form Screen" pattern) rather than anything custom. Per display-guidelines.md
+// / add-text-input skill: a standard text input opens the on-glasses composer
+// (Neural Band handwriting, dictation) on focus + TAP — not on focus alone,
+// and never via a programmatic .focus(). A pinch on a focused text input is
+// consumed by the composer instead of reaching page JS at all, so no SDK call
+// is needed here. That also means the Enter->data-submit-action path in the
+// keydown handler below (copied from the official template) never actually
+// fires from a pinch on real hardware while this field is focused — it's a
+// keyboard-testing/fallback affordance, not the handwriting entry point.
+
+(function () {
+  'use strict';
+
+  var STORAGE_KEY = 'mrbd:watchlist';
+  var REFRESH_MS = 20000;
+
+  var state = {
+    currentScreen: 'home',
+    screenHistory: [],
+    watchlist: [],   // [{ symbol, muted }]
+    rawCache: {},    // symbol -> { quote, articles }
+    display: [],     // derived per render
+    currentIdx: null,
+    tick: 0,
+  };
+
+  var screens = {};
+
+  function collectScreens() {
+    document.querySelectorAll('.screen').forEach(function (s) {
+      if (s.id) screens[s.id] = s;
+    });
+  }
+
+  // ==================== NAVIGATION ====================
+  function navigateTo(screenId, options) {
+    options = options || {};
+    var addToHistory = options.addToHistory !== false;
+    if (addToHistory && state.currentScreen) state.screenHistory.push(state.currentScreen);
+
+    Object.values(screens).forEach(function (s) { s.classList.add('hidden'); });
+    if (screens[screenId]) {
+      screens[screenId].classList.remove('hidden');
+      state.currentScreen = screenId;
+      focusFirst(screens[screenId]);
+    }
+  }
+
+  function navigateBack() {
+    if (state.screenHistory.length > 0) {
+      navigateTo(state.screenHistory.pop(), { addToHistory: false });
+    }
+  }
+
+  // ==================== FOCUS MANAGEMENT ====================
+  function focusFirst(container) {
+    var el = container.querySelector('.focusable:not([disabled]):not(.hidden)');
+    if (el) el.focus();
+  }
+
+  function moveFocus(direction) {
+    var container = screens[state.currentScreen];
+    if (!container) return;
+    var focusables = Array.from(container.querySelectorAll('.focusable:not([disabled]):not(.hidden)'));
+    if (focusables.length === 0) return;
+
+    var idx = focusables.indexOf(document.activeElement);
+    if (idx === -1) { focusFirst(container); return; }
+
+    var nextIdx;
+    if (direction === 'up' || direction === 'left') {
+      nextIdx = idx > 0 ? idx - 1 : focusables.length - 1;
+    } else {
+      nextIdx = idx < focusables.length - 1 ? idx + 1 : 0;
+    }
+    focusables[nextIdx].focus();
+    focusables[nextIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
+  // ==================== DATA ====================
+  function setLoading(isLoading) {
+    document.getElementById('loading').classList.toggle('hidden', !isLoading);
+  }
+
+  async function loadWatchlist() {
+    var saved = await storageGet(STORAGE_KEY);
+    state.watchlist = saved ?? DEFAULT_TICKERS.map(function (symbol) { return { symbol: symbol, muted: false }; });
+  }
+
+  async function refreshData() {
+    await Promise.all(state.watchlist.map(async function (w) {
+      var quote = await fetchQuote(w.symbol, state.tick);
+      var articles = await fetchHeadlines(w.symbol, state.tick);
+      state.rawCache[w.symbol] = { quote: quote, articles: articles };
+    }));
+  }
+
+  function buildDisplay() {
+    state.display = state.watchlist.map(function (w) {
+      var cached = state.rawCache[w.symbol];
+      if (!cached) {
+        return { symbol: w.symbol, muted: w.muted, price: '—', changePct: 0, up: true, headline: 'Loading…', tag: null, articles: [] };
+      }
+      var ranked = rankArticles(cached.articles, cached.quote.changePct);
+      return {
+        symbol: w.symbol,
+        muted: w.muted,
+        price: cached.quote.price,
+        changePct: cached.quote.changePct,
+        up: cached.quote.changePct >= 0,
+        headline: ranked[0] ? ranked[0].text : '',
+        tag: !w.muted && shouldTagCatalyst(ranked) ? 'CATALYST' : null,
+        articles: ranked,
+      };
+    });
+  }
+
+  // ==================== RENDER ====================
+  function renderHome() {
+    var container = document.getElementById('tickerList');
+    container.innerHTML = '';
+    if (state.display.length === 0) {
+      container.innerHTML = '<div class="empty-state">Watchlist is empty.</div>';
+      return;
+    }
+    state.display.forEach(function (d, i) {
+      var el = document.createElement('div');
+      el.className = 'list-item focusable' + (d.muted ? ' is-muted' : '');
+      el.tabIndex = 0;
+      el.dataset.action = 'open-detail';
+      el.dataset.idx = i;
+      el.innerHTML =
+        '<div class="list-item-content">' +
+          '<div class="list-item-title">' + d.symbol + '</div>' +
+          '<div class="list-item-meta">' + (d.muted ? 'Muted' : escapeHtml(d.headline)) + '</div>' +
+        '</div>' +
+        '<div class="list-item-stats">' +
+          '<div class="list-item-price">' + d.price + '</div>' +
+          '<div class="list-item-change ' + (d.up ? 'change-up' : 'change-down') + '">' + (d.up ? '+' : '') + d.changePct + '%</div>' +
+        '</div>' +
+        (d.tag ? '<span class="badge">' + d.tag + '</span>' : '');
+      container.appendChild(el);
+    });
+  }
+
+  function formatAge(minutesAgo) {
+    if (minutesAgo < 60) return minutesAgo + 'm ago';
+    if (minutesAgo < 1440) return Math.round(minutesAgo / 60) + 'h ago';
+    return Math.round(minutesAgo / 1440) + 'd ago';
+  }
+
+  function escapeHtml(s) {
+    var div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  function renderDetail() {
+    var d = state.display[state.currentIdx];
+    document.getElementById('detail-ticker').textContent = d.symbol + '  ' + d.price;
+    var changeEl = document.getElementById('detail-change');
+    changeEl.textContent = (d.up ? '+' : '') + d.changePct + '%';
+    changeEl.style.color = d.up ? 'var(--green)' : 'var(--red)';
+
+    var list = document.getElementById('articleList');
+    list.innerHTML = d.articles.map(function (a) {
+      return '<div class="article">' +
+        '<div class="article-meta"><span class="article-source">' + (a.top ? '<span class="top-label">TOP</span>' : '') + escapeHtml(a.source) + '</span>' +
+        '<span class="article-time">' + formatAge(a.minutesAgo) + '</span></div>' +
+        '<div class="article-text">' + escapeHtml(a.text) + '</div></div>';
+    }).join('') || '<div class="empty-state">No headlines.</div>';
+
+    var muteBtn = document.getElementById('mute-btn');
+    muteBtn.textContent = d.muted ? 'Unmute' : 'Mute';
+    muteBtn.classList.toggle('muted-state', d.muted);
+  }
+
+  // ==================== ACTIONS ====================
+  async function saveWatchlist() {
+    await storageSet(STORAGE_KEY, state.watchlist);
+  }
+
+  function handleAction(action, element) {
+    switch (action) {
+      case 'back':
+        navigateBack();
+        break;
+      case 'open-detail':
+        state.currentIdx = parseInt(element.dataset.idx, 10);
+        renderDetail();
+        navigateTo('detail');
+        break;
+      case 'toggle-mute':
+        state.watchlist[state.currentIdx].muted = !state.watchlist[state.currentIdx].muted;
+        buildDisplay();
+        renderDetail();
+        renderHome();
+        saveWatchlist();
+        break;
+      case 'remove-ticker':
+        state.watchlist.splice(state.currentIdx, 1);
+        state.currentIdx = null;
+        buildDisplay();
+        renderHome();
+        saveWatchlist();
+        navigateBack();
+        break;
+      case 'go-add-ticker': {
+        var input = document.getElementById('new-ticker-input');
+        input.value = '';
+        document.getElementById('add-ticker-hint').textContent = 'Tap the field to write, dictate, or type a symbol.';
+        navigateTo('add-ticker');
+        break;
+      }
+      case 'save-ticker':
+        addTicker();
+        break;
+    }
+  }
+
+  async function addTicker() {
+    var input = document.getElementById('new-ticker-input');
+    var hint = document.getElementById('add-ticker-hint');
+    // Voice dictation commonly appends trailing punctuation (e.g. "AAPL.")
+    // as sentence-ending style -- strip trailing punctuation only, so a
+    // real mid-symbol period (BRK.B) survives.
+    var raw = input.value.trim().toUpperCase().replace(/[.,!?;:]+$/, '');
+    if (!raw) return;
+    if (state.watchlist.some(function (w) { return w.symbol === raw; })) {
+      hint.textContent = raw + ' is already on your watchlist.';
+      return;
+    }
+    hint.textContent = 'Adding ' + raw + '…';
+    try {
+      state.watchlist.push({ symbol: raw, muted: false });
+      var quote = await fetchQuote(raw, state.tick);
+      var articles = await fetchHeadlines(raw, state.tick);
+      state.rawCache[raw] = { quote: quote, articles: articles };
+      buildDisplay();
+      renderHome();
+      await saveWatchlist();
+      navigateBack();
+    } catch (e) {
+      state.watchlist.pop();
+      hint.textContent = 'Could not add ' + raw + ': ' + e.message;
+    }
+  }
+
+  // ==================== EVENTS ====================
+  function setupEvents() {
+    document.addEventListener('click', function (e) {
+      var actionEl = e.target.closest('[data-action]');
+      if (actionEl) handleAction(actionEl.dataset.action, actionEl);
+    });
+
+    document.addEventListener('keydown', function (e) {
+      var active = document.activeElement;
+      var isInput = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+
+      // Matches the current official template's keydown handler exactly
+      // (create-webapp/templates/app.js). While a text field is focused,
+      // only Enter/Escape are intercepted — everything else (typing) is left
+      // to the browser/OS. On real hardware a pinch on a focused text input
+      // is consumed by the on-glasses composer *before it reaches page JS at
+      // all* (see display-guidelines.md's "Pinch, drag, and text entry"),
+      // so this Enter->submitAction path is effectively a keyboard-testing/
+      // fallback affordance, not the primary handwriting/dictation flow.
+      if (isInput && e.key !== 'Enter' && e.key !== 'Escape') return;
+
+      switch (e.key) {
+        case 'ArrowUp': moveFocus('up'); e.preventDefault(); break;
+        case 'ArrowDown': moveFocus('down'); e.preventDefault(); break;
+        case 'ArrowLeft': moveFocus('left'); e.preventDefault(); break;
+        case 'ArrowRight': moveFocus('right'); e.preventDefault(); break;
+        case 'Enter':
+          if (isInput) {
+            var submitAction = active.dataset.submitAction;
+            if (submitAction) handleAction(submitAction, active);
+          } else if (active && active.classList.contains('focusable')) {
+            active.click();
+          }
+          e.preventDefault();
+          break;
+        case 'Escape':
+          navigateBack();
+          e.preventDefault();
+          break;
+      }
+    });
+
+    var tickerInput = document.getElementById('new-ticker-input');
+    tickerInput.addEventListener('input', function () {
+      document.getElementById('add-ticker-hint').textContent = '';
+    });
+  }
+
+  // ==================== INIT ====================
+  async function init() {
+    collectScreens();
+    setupEvents();
+    setLoading(true);
+    await loadWatchlist();
+    await refreshData();
+    buildDisplay();
+    setLoading(false);
+    renderHome();
+    navigateTo('home', { addToHistory: false });
+
+    setInterval(async function () {
+      state.tick += 1;
+      await refreshData();
+      buildDisplay();
+      renderHome();
+      if (state.currentScreen === 'detail') renderDetail();
+    }, REFRESH_MS);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+  </script>
 </body>
 </html>

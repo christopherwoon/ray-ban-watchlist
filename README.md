@@ -75,6 +75,21 @@ issue. Inlining removes the second network request entirely. If you edit
 styles, edit the `<style>` block in `glasses/index.html` directly — there's
 no longer a separate CSS file for glasses to keep in sync.
 
+Same fix applied to the JS (2026-09-16): `glasses/index.html` now inlines
+`storage.js`, `scoring.js`, `data.js`, and the glasses `app.js` into one
+`<script>` block instead of four separate `<script src>` tags. Reported
+symptom on-device: the ticker list stayed completely empty (not even the
+"Watchlist is empty" message, which only renders from JS) and every button
+press, including "+ Add Ticker", did nothing. That combination means no JS
+ran at all — `app.js` is the last of the four script requests, and losing
+it (or a file it depends on) leaves only the static HTML shell, since
+`setupEvents()` (click handling) and `renderHome()` (list rendering) both
+live inside it. Root cause presumed to be the same class of intermittent
+script-load failure already confirmed for the CSS case above. If you edit
+`storage.js`, `scoring.js`, or `data.js` (shared with the phone page), copy
+the change into the `<script>` block in `glasses/index.html` too — there's
+no longer a build step that would do this automatically.
+
 ## Toolkit compliance
 
 `glasses/` was rebuilt against the actual toolkit template
