@@ -766,10 +766,14 @@ async function fetchHeadlines(ticker, tick = 0) {
   async function addTicker() {
     var input = document.getElementById('new-ticker-input');
     var hint = document.getElementById('add-ticker-hint');
-    // Voice dictation commonly appends trailing punctuation (e.g. "AAPL.")
-    // as sentence-ending style -- strip trailing punctuation only, so a
-    // real mid-symbol period (BRK.B) survives.
-    var raw = input.value.trim().toUpperCase().replace(/[.,!?;:]+$/, '');
+    // Voice dictation commonly appends trailing punctuation (e.g. "AAPL.",
+    // or "AAPL ." with the period as its own token) as sentence-ending
+    // style -- strip trailing punctuation *and* any whitespace left behind
+    // by that in the same pass (a lone .trim() first doesn't catch a space
+    // that's only exposed after the punctuation is removed), so a real
+    // mid-symbol period (BRK.B) survives but a dictated "AAPL ." doesn't
+    // end up as the unsearchable symbol "AAPL ".
+    var raw = input.value.trim().toUpperCase().replace(/[.,!?;:\s]+$/, '');
     if (!raw) return;
     if (state.watchlist.some(function (w) { return w.symbol === raw; })) {
       hint.textContent = raw + ' is already on your watchlist.';
